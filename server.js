@@ -1,271 +1,298 @@
 const express = require('express');
 const http = require('http');
-const socketIO = require('socket.io');
+const socketIo = require('socket.io');
 const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
 const rateLimit = require('express-rate-limit');
+const path = require('path');
 require('dotenv').config();
 
-const WhatsAppManager = require('./whatsapp');
-const SessionManager = require('./sessionManager');
+const WhatsAppBot = require('./whatsapp-bot');
 
-const app = express();
-const server = http.createServer(app);
-const io = socketIO(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"],
-        credentials: true
+class WhatsAppBotServer {
+    constructor() {
+        this.app = express();
+        this.server = http.createServer(this.app);
+        this.io = socketIo(this.server, {
+            cors: {
+                origin: process.env.ALLOWED_ORIGINS?.split(',') || ["http://localhost:3000"],
+                methods: ["GET", "POST"],
+                credentials: true
+            }
+        });
+        
+        this.bot = null;
+        this.activeSessions = new Map();
+        this.port = process.env.PORT || 3000;
+        
+        this.setupMiddleware();
+        this.setupRoutes();
+        this.setupSocketHandlers();
     }
-});
 
-// Middleware
-app.use(cors({
-    origin: "*",
-    methods: ["GET", "POST", "PUT", "DELETE"],
-    allowedHeaders: ["Content-Type", "Authorization"]
-}));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// Rate limiting
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // limit each IP to 100 requests per windowMs
-    message: 'Too many requests from this IP, please try again later.'
-});
-app.use('/api', limiter);
-
-// Global variables
-const sessionManager = new SessionManager();
-const whatsappInstances = new Map();
-
-// Health check endpoint
-app.get('/', (req, res) => {
-    res.json({
-        status: 'WhatsApp Auto Bot Server Running',
-        timestamp: new Date().toISOString(),
-        activeSessions: whatsappInstances.size,
-        version: '1.0.0'
-    });
-});
-
-// API Routes
-app.get('/api/status', (req, res) => {
-    const sessions = [];
-    whatsappInstances.forEach((instance, sessionId) => {
-        sessions.push({
-            sessionId,
-            isReady: instance.isReady,
-            status: instance.status,
-            createdAt: instance.createdAt
-        });
-    });
-    
-    res.json({
-        totalSessions: sessions.length,
-        sessions
-    });
-});
-
-app.post('/api/create-session', async (req, res) => {
-    try {
-        const sessionId = sessionManager.generateSessionId();
-        const whatsappManager = new WhatsAppManager(sessionId, io);
-        
-        whatsappInstances.set(sessionId, whatsappManager);
-        await whatsappManager.initialize();
-        
-        res.json({
-            success: true,
-            sessionId,
-            message: 'Session created successfully'
-        });
-    } catch (error) {
-        console.error('Error creating session:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to create session',
-            error: error.message
-        });
-    }
-});
-
-app.delete('/api/session/:sessionId', async (req, res) => {
-    try {
-        const { sessionId } = req.params;
-        const instance = whatsappInstances.get(sessionId);
-        
-        if (!instance) {
-            return res.status(404).json({
-                success: false,
-                message: 'Session not found'
-            });
-        }
-        
-        await instance.destroy();
-        whatsappInstances.delete(sessionId);
-        
-        res.json({
-            success: true,
-            message: 'Session deleted successfully'
-        });
-    } catch (error) {
-        console.error('Error deleting session:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to delete session',
-            error: error.message
-        });
-    }
-});
-
-app.post('/api/send-message', async (req, res) => {
-    try {
-        const { sessionId, to, message } = req.body;
-        
-        if (!sessionId || !to || !message) {
-            return res.status(400).json({
-                success: false,
-                message: 'sessionId, to, and message are required'
-            });
-        }
-        
-        const instance = whatsappInstances.get(sessionId);
-        if (!instance || !instance.isReady) {
-            return res.status(404).json({
-                success: false,
-                message: 'Session not found or not ready'
-            });
-        }
-        
-        await instance.sendMessage(to, message);
-        
-        res.json({
-            success: true,
-            message: 'Message sent successfully'
-        });
-    } catch (error) {
-        console.error('Error sending message:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to send message',
-            error: error.message
-        });
-    }
-});
-
-// Socket.io connection handling
-io.on('connection', (socket) => {
-    console.log(`🔗 Client connected: ${socket.id}`);
-    
-    socket.on('start_session', async () => {
-        try {
-            const sessionId = sessionManager.generateSessionId();
-            const whatsappManager = new WhatsAppManager(sessionId, io, socket);
-            
-            whatsappInstances.set(sessionId, whatsappManager);
-            socket.sessionId = sessionId;
-            
-            console.log(`🚀 Starting session: ${sessionId}`);
-            await whatsappManager.initialize();
-            
-        } catch (error) {
-            console.error('Error starting session:', error);
-            socket.emit('error', error.message);
-        }
-    });
-    
-    socket.on('stop_session', async () => {
-        try {
-            if (socket.sessionId) {
-                const instance = whatsappInstances.get(socket.sessionId);
-                if (instance) {
-                    await instance.destroy();
-                    whatsappInstances.delete(socket.sessionId);
-                    console.log(`🛑 Session stopped: ${socket.sessionId}`);
+    setupMiddleware() {
+        // Security middleware
+        this.app.use(helmet({
+            contentSecurityPolicy: {
+                directives: {
+                    defaultSrc: ["'self'"],
+                    styleSrc: ["'self'", "'unsafe-inline'"],
+                    scriptSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com"],
+                    connectSrc: ["'self'", "ws:", "wss:"],
+                    imgSrc: ["'self'", "data:", "https:"]
                 }
-                socket.sessionId = null;
             }
-        } catch (error) {
-            console.error('Error stopping session:', error);
-            socket.emit('error', error.message);
-        }
-    });
-    
-    socket.on('disconnect', async (reason) => {
-        console.log(`🔌 Client disconnected: ${socket.id}, Reason: ${reason}`);
+        }));
         
-        if (socket.sessionId) {
-            const instance = whatsappInstances.get(socket.sessionId);
-            if (instance) {
-                // Don't destroy on disconnect, keep session alive
-                console.log(`⏸️  Session paused: ${socket.sessionId}`);
+        this.app.use(compression());
+        this.app.use(cors({
+            origin: process.env.ALLOWED_ORIGINS?.split(',') || ["http://localhost:3000"],
+            credentials: true
+        }));
+        
+        this.app.use(express.json({ limit: '10mb' }));
+        this.app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+        // Rate limiting
+        const limiter = rateLimit({
+            windowMs: 15 * 60 * 1000, // 15 minutes
+            max: 100, // limit each IP to 100 requests per windowMs
+            message: 'Too many requests, please try again later.',
+            standardHeaders: true,
+            legacyHeaders: false
+        });
+        this.app.use(limiter);
+    }
+
+    setupRoutes() {
+        // Health check endpoint
+        this.app.get('/health', (req, res) => {
+            res.json({
+                status: 'healthy',
+                timestamp: new Date().toISOString(),
+                uptime: process.uptime(),
+                sessions: this.activeSessions.size,
+                memory: process.memoryUsage()
+            });
+        });
+
+        // API Routes
+        this.app.get('/api/status', (req, res) => {
+            const botStatus = this.bot ? this.bot.getStatus() : { connected: false };
+            res.json({
+                bot: botStatus,
+                sessions: this.activeSessions.size,
+                server: {
+                    uptime: process.uptime(),
+                    nodeVersion: process.version,
+                    platform: process.platform
+                }
+            });
+        });
+
+        this.app.post('/api/send-message', async (req, res) => {
+            try {
+                const { to, message } = req.body;
+                
+                if (!this.bot || !this.bot.isReady()) {
+                    return res.status(400).json({
+                        success: false,
+                        error: 'Bot is not connected to WhatsApp'
+                    });
+                }
+
+                const result = await this.bot.sendMessage(to, message);
+                res.json({
+                    success: true,
+                    data: result
+                });
+            } catch (error) {
+                console.error('Send message error:', error);
+                res.status(500).json({
+                    success: false,
+                    error: error.message
+                });
             }
-        }
-    });
-});
+        });
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-    console.log('🔄 SIGTERM received, shutting down gracefully...');
-    
-    // Close all WhatsApp instances
-    for (const [sessionId, instance] of whatsappInstances) {
-        try {
-            await instance.destroy();
-            console.log(`✅ Session ${sessionId} destroyed`);
-        } catch (error) {
-            console.error(`❌ Error destroying session ${sessionId}:`, error);
+        this.app.get('/api/chat-history/:contact', (req, res) => {
+            try {
+                const { contact } = req.params;
+                const history = this.bot ? this.bot.getChatHistory(contact) : [];
+                
+                res.json({
+                    success: true,
+                    data: {
+                        contact,
+                        messages: history
+                    }
+                });
+            } catch (error) {
+                console.error('Chat history error:', error);
+                res.status(500).json({
+                    success: false,
+                    error: error.message
+                });
+            }
+        });
+
+        // Serve static files in production
+        if (process.env.NODE_ENV === 'production') {
+            this.app.use(express.static(path.join(__dirname, 'public')));
+            
+            this.app.get('*', (req, res) => {
+                res.sendFile(path.join(__dirname, 'public', 'index.html'));
+            });
         }
+
+        // 404 handler
+        this.app.use('*', (req, res) => {
+            res.status(404).json({
+                success: false,
+                error: 'Endpoint not found'
+            });
+        });
+
+        // Error handler
+        this.app.use((err, req, res, next) => {
+            console.error('Server error:', err);
+            res.status(500).json({
+                success: false,
+                error: process.env.NODE_ENV === 'development' ? err.message : 'Internal server error'
+            });
+        });
     }
-    
-    server.close(() => {
-        console.log('🏁 Server closed');
-        process.exit(0);
-    });
-});
 
-process.on('SIGINT', async () => {
-    console.log('🔄 SIGINT received, shutting down gracefully...');
-    
-    // Close all WhatsApp instances
-    for (const [sessionId, instance] of whatsappInstances) {
-        try {
-            await instance.destroy();
-            console.log(`✅ Session ${sessionId} destroyed`);
-        } catch (error) {
-            console.error(`❌ Error destroying session ${sessionId}:`, error);
-        }
+    setupSocketHandlers() {
+        this.io.on('connection', (socket) => {
+            console.log(`Client connected: ${socket.id}`);
+
+            // Handle session start
+            socket.on('start-session', async () => {
+                try {
+                    console.log('Starting WhatsApp session for client:', socket.id);
+                    
+                    // Create new bot instance if doesn't exist
+                    if (!this.bot) {
+                        this.bot = new WhatsAppBot(socket);
+                        
+                        // Add timeout for initialization
+                        const initTimeout = setTimeout(() => {
+                            socket.emit('error', 'Bot initialization timeout. Please try again.');
+                        }, 60000); // 60 seconds timeout
+                        
+                        await this.bot.initialize();
+                        clearTimeout(initTimeout);
+                    } else {
+                        // Attach socket to existing bot
+                        this.bot.attachSocket(socket);
+                    }
+                    
+                    this.activeSessions.set(socket.id, {
+                        startTime: new Date(),
+                        bot: this.bot
+                    });
+
+                } catch (error) {
+                    console.error('Failed to start session:', error);
+                    socket.emit('error', `Failed to start session: ${error.message}`);
+                }
+            });
+
+            // Handle session stop
+            socket.on('stop-session', () => {
+                console.log('Stopping session for client:', socket.id);
+                
+                if (this.bot) {
+                    this.bot.destroy();
+                    this.bot = null;
+                }
+                
+                this.activeSessions.delete(socket.id);
+                socket.emit('disconnected', 'Session stopped by user');
+            });
+
+            // Handle manual message send
+            socket.on('send-message', async (data) => {
+                try {
+                    const { to, message } = data;
+                    
+                    if (!this.bot || !this.bot.isReady()) {
+                        socket.emit('error', 'Bot is not connected to WhatsApp');
+                        return;
+                    }
+
+                    await this.bot.sendMessage(to, message);
+                    socket.emit('message-sent', { to, message });
+                } catch (error) {
+                    console.error('Manual send error:', error);
+                    socket.emit('error', error.message);
+                }
+            });
+
+            // Handle get chat history
+            socket.on('get-chat-history', (contact) => {
+                try {
+                    const history = this.bot ? this.bot.getChatHistory(contact) : [];
+                    socket.emit('chat-history', { contact, messages: history });
+                } catch (error) {
+                    console.error('Get chat history error:', error);
+                    socket.emit('error', error.message);
+                }
+            });
+
+            // Handle disconnect
+            socket.on('disconnect', (reason) => {
+                console.log(`Client disconnected: ${socket.id}, reason: ${reason}`);
+                this.activeSessions.delete(socket.id);
+                
+                // If no active sessions, clean up bot
+                if (this.activeSessions.size === 0 && this.bot) {
+                    setTimeout(() => {
+                        if (this.activeSessions.size === 0 && this.bot) {
+                            console.log('No active sessions, cleaning up bot...');
+                            this.bot.destroy();
+                            this.bot = null;
+                        }
+                    }, 30000); // 30 seconds grace period
+                }
+            });
+        });
     }
-    
-    server.close(() => {
-        console.log('🏁 Server closed');
-        process.exit(0);
-    });
-});
 
-// Error handling
-app.use((err, req, res, next) => {
-    console.error('❌ Server Error:', err.stack);
-    res.status(500).json({
-        success: false,
-        message: 'Internal server error',
-        error: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
-    });
-});
+    start() {
+        this.server.listen(this.port, () => {
+            console.log('🚀 WhatsApp AI Bot Server Started!');
+            console.log(`📡 Server running on port: ${this.port}`);
+            console.log(`🌍 Environment: ${process.env.NODE_ENV}`);
+            console.log(`🔑 Gemini API: ${process.env.GEMINI_API_KEY ? 'Configured ✅' : 'Missing ❌'}`);
+            console.log('='.repeat(50));
+        });
 
-// 404 handler
-app.use((req, res) => {
-    res.status(404).json({
-        success: false,
-        message: 'Endpoint not found'
-    });
-});
+        // Graceful shutdown
+        process.on('SIGTERM', this.shutdown.bind(this));
+        process.on('SIGINT', this.shutdown.bind(this));
+    }
 
-const PORT = process.env.PORT || 3000;
+    async shutdown() {
+        console.log('🛑 Shutting down server gracefully...');
+        
+        // Close all WhatsApp sessions
+        if (this.bot) {
+            await this.bot.destroy();
+        }
+        
+        // Close server
+        this.server.close(() => {
+            console.log('✅ Server shut down complete');
+            process.exit(0);
+        });
+    }
+}
 
-server.listen(PORT, () => {
-    console.log(`🚀 WhatsApp Auto Bot Server running on port ${PORT}`);
-    console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`📱 Ready to accept WhatsApp connections!`);
-});
+// Start the server
+const server = new WhatsAppBotServer();
+server.start();
+
+module.exports = WhatsAppBotServer;
