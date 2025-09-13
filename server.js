@@ -5,7 +5,6 @@ const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
-const path = require('path');
 require('dotenv').config();
 
 const WhatsAppBot = require('./whatsapp-bot');
@@ -137,14 +136,21 @@ class WhatsAppBotServer {
             }
         });
 
-        // Serve static files in production
-        if (process.env.NODE_ENV === 'production') {
-            this.app.use(express.static(path.join(__dirname, 'public')));
-            
-            this.app.get('*', (req, res) => {
-                res.sendFile(path.join(__dirname, 'public', 'index.html'));
+        // API-only server - Frontend hosted separately
+        this.app.get('/', (req, res) => {
+            res.json({
+                message: 'WhatsApp AI Bot API Server',
+                status: 'running',
+                version: '1.0.0',
+                endpoints: {
+                    health: '/health',
+                    status: '/api/status',
+                    sendMessage: '/api/send-message',
+                    chatHistory: '/api/chat-history/:contact'
+                },
+                websocket: 'Socket.io enabled for real-time communication'
             });
-        }
+        });
 
         // 404 handler
         this.app.use('*', (req, res) => {
